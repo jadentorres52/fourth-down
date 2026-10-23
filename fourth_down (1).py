@@ -69,10 +69,12 @@ INDEX_PATH = HERE / "index.html"           # the UI: one static file, no npm and
 _today = dt.date.today()
 CURRENT_SEASON = _today.year if _today.month >= 9 else _today.year - 1
 
-# Win probability and conversion models use complete seasons from 2016 on. By 2016 both the
-# longer extra point (2015) and kickoff touchbacks at the 25 (2016) were in place, so late-game
-# scoring math looks like today's. More seasons = more data for the harder-to-learn models.
-MODEL_SEASONS = list(range(2016, CURRENT_SEASON))
+# Win probability and conversion models use complete seasons from 2011 on, when kickoffs moved up
+# to the 35 and the modern touchback era began. Starting in 2016 instead (closer to today's rules)
+# left the win probability model too little data to learn what field position is worth early in
+# games: it called 4th & 3 at your own 11 in the 1st quarter a go. Adding 2011-2015 improved its
+# log loss on the 2025 holdout from 0.4823 to 0.4790 and turned that call into a punt.
+MODEL_SEASONS = list(range(2011, CURRENT_SEASON))
 
 # Field goals and punts use modern kickers and punters only. Long-range field goal accuracy has
 # climbed fast (in this data, 50+ yard kicks went from about 59% in 2016 to about 69% in 2024-25),
@@ -89,6 +91,35 @@ PLAY_SECONDS = 6   # game clock a 4th-down play (or kick) burns
 TD_POINTS = 7      # a touchdown plus the extra point, which is good almost every time
 FG_OFFSET = 18     # kick distance = yards to the end zone + 18 (end zone + snap); median in the data
 OPTIONS = ["go", "fg", "punt"]   # this index order is shared with the frontend
+
+# Tree models are step functions, so a learned curve can jump between neighboring yard lines. When two
+# options are close, those jumps made the call flip back and forth from one yard line to the next.
+# The engine averages each learned field-position effect over the two yard lines on each side,
+# weighted toward the middle. Pairs are (yard offset, weight); the page reads the same list.
+SMOOTHING = [(-2, 1), (-1, 2), (0, 3), (1, 2), (2, 1)]
+
+# A deliberate conservative lean. This is a product choice, not something the models estimate: early in a
+# game, failing on 4th down in your own half counts extra against going for it. The penalty is
+# FAIL_PENALTY of win probability at your own 1, shrinking to nothing at your own 45 (OWN_HALF_LINE), and
+# it fades out over the 3rd quarter so late-game comebacks are untouched. Pure win probability calls
+# many own-territory spots near coin flips (4th & 2 at your own 16 in a tied 1st quarter: 44.7% to go
+# for it vs 44.4% to punt), and few coaches would risk handing over a short field that early.
+FAIL_PENALTY = 0.15
+OWN_HALF_LINE = 55   # yardline_100 of your own 45
+
+# A second lean, also a product choice: early in a game, take the points. The raw models go for it on
+# 4th & 5 everywhere inside the opponent's 35, and treat a 59-yard try from the opponent's 41 as a coin
+# flip against punting. For kicks of 59 yards or shorter (the opponent's 41 and in), the field goal
+# gets a bonus of up to FG_BONUS of win probability, times the chance the kick is good. It phases in
+# over the FG_RAMP yards before the 41 and fades out over the 3rd quarter like the penalty above.
+FG_BONUS = 0.03
+FG_RANGE_LINE = 44   # yardline_100 where the bonus starts (a 62-yard try)
+FG_RAMP = 3          # yards to reach full strength, at the opponent's 41
+
+# 4th-and-inches is logged as 4th & 1 in the play-by-play, so the data can't say how much easier it is.
+# The calculator assumes inches cuts the chance of failing by a third, another judgment call: at
+# midfield, a 68% conversion chance for a full yard becomes 79% for inches. ydstogo = 0 means inches.
+INCHES_FAIL_SHARE = 2 / 3
 
 # Only these columns are kept from nflverse's ~370-column play-by-play table.
 PBP_COLUMNS = [
@@ -122,11 +153,17 @@ WP_FEATURES = {
 }
 CONV_FEATURES = {
     "ydstogo": -1,          # longer = harder
-    "yardline_100": 0,      # near the goal line the field compresses, so no fixed direction
+    "yardline_capped": 1,   # field position, but only inside the 20, where the field compresses and
+                            # converting gets harder. Farther out it's held constant: left free, the
+                            # model learned from rare, unusual attempts deep in a team's own territory
+                            # and gave 4th & 3 at your own 11 a 63% chance (the league converts ~51%).
     "goal_to_go": 0,        # on 4th-and-goal, converting means scoring a touchdown
     "posteam_spread": 1,    # the pregame line as a stand-in for how good the offense is
 }
 FG_FEATURES = ["kick_distance", "indoors"]
+STATE_COLUMNS = ["yardline_100", "ydstogo", "down", "score_differential", "game_seconds_remaining", "half_seconds_remaining",
+                 "posteam_timeouts_remaining", "defteam_timeouts_remaining", "posteam_spread", "indoors"]
+RED_ZONE = 20   # yardline_capped = min(yards to the end zone, RED_ZONE)
 
 
 # ===========================================================================
@@ -156,6 +193,7 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df["spread_time"] = df["posteam_spread"] * decay
     df["diff_time_ratio"] = df["score_differential"] / decay
     df["goal_to_go"] = (df["ydstogo"] >= df["yardline_100"]).astype(int)
+    df["yardline_capped"] = np.minimum(df["yardline_100"], RED_ZONE)
     df["kick_distance"] = df["yardline_100"] + FG_OFFSET
     df["indoors"] = df["indoors"].astype(int) if "indoors" in df else 0
     return df
@@ -187,7 +225,7 @@ def download(season: int) -> pd.DataFrame | None:
 
     try:
         print(f"Downloading {season} play-by-play...")
-        return nfl.load_pbp(season).select(PBP_COLUMNS).to_pandas()
+        return _trim(nfl.load_pbp(season).select(PBP_COLUMNS).to_pandas())
     except Exception as exc:  # most likely the season hasn't started yet
         print(f"  Skipping {season}: {exc}")
         return None
@@ -198,12 +236,20 @@ def load_pbp() -> pd.DataFrame:
     so retraining once a week picks up the newest games."""
     completed = [s for s in ALL_SEASONS if s < CURRENT_SEASON]
     cached = pd.read_parquet(CACHE_PATH) if CACHE_PATH.exists() else None
-    if cached is None or sorted(cached["season"].unique().tolist()) != completed:
+    if cached is None or sorted(cached["season"].unique().tolist()) != completed or not set(PBP_COLUMNS) <= set(cached.columns):
         frames = [f for f in (download(s) for s in completed) if f is not None]
         cached = pd.concat(frames, ignore_index=True)
         cached.to_parquet(CACHE_PATH)
     current = download(CURRENT_SEASON) if CURRENT_SEASON in ALL_SEASONS else None
-    return pd.concat([cached, current], ignore_index=True) if current is not None else cached
+    return _trim(pd.concat([cached, current], ignore_index=True) if current is not None else cached)
+
+
+def _trim(pbp: pd.DataFrame) -> pd.DataFrame:
+    """Fifteen-plus seasons is a lot of memory, so each season is slimmed as it arrives. Only 4th downs
+    use the play descriptions (to spot fake punts and show real plays), and 32-bit numbers are
+    plenty (XGBoost uses them anyway)."""
+    pbp.loc[pbp["down"] != 4, "desc"] = None
+    return pbp.astype(dict.fromkeys(pbp.select_dtypes("float64").columns, "float32"))
 
 
 def prepare(pbp: pd.DataFrame) -> pd.DataFrame:
@@ -234,14 +280,17 @@ def prepare(pbp: pd.DataFrame) -> pd.DataFrame:
 def wp_rows(df: pd.DataFrame) -> pd.DataFrame:
     """Every scrimmage play, labeled with whether the team that had the ball went on to win.
     Ties are dropped (rare, and they don't fit a win/loss label)."""
-    return df[~df["tie"]].dropna(subset=["posteam_spread", "posteam_timeouts_remaining", "result"])
+    rows = df[~df["tie"]].dropna(subset=["posteam_spread", "posteam_timeouts_remaining", "result"])
+    return rows[STATE_COLUMNS + ["won", "season"]]  # only the columns needed, to keep memory down
 
 
 def conversion_rows(df: pd.DataFrame) -> pd.DataFrame:
     """Real 4th-down attempts (runs and passes, including fakes). nflverse's fourth_down_converted
     already counts touchdowns as conversions, which we checked against the 2025 data."""
     att = df[(df["down"] == 4) & df["play_type"].isin(["run", "pass"])]
-    return att.dropna(subset=["posteam_spread"])
+    # Fake punts and fake field goals aren't a decision to go for it; they're surprise plays.
+    fake = att["desc"].str.contains("Punt formation|Field Goal formation", case=False, na=False)
+    return att[~fake].dropna(subset=["posteam_spread"])
 
 
 def field_goal_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -269,13 +318,14 @@ def fit_models(df: pd.DataFrame, model_seasons: list[int], kick_seasons: list[in
 
     # 1. Win probability: gradient-boosted trees (XGBoost). Trees handle the interactions that make
     # WP hard (a 7-point lead means little in the 1st quarter and nearly everything with 2 minutes
-    # left) without hand-built features for each one. Every play in a game shares one label (who
-    # won), so there are only a few thousand truly independent examples despite ~400k rows; shallow
-    # trees and big minimum leaf sizes stop the model from memorizing individual games.
+    # left) without hand-built features for each one. An earlier version used shallow trees with big
+    # leaves, chosen to minimize calibration error on one held-out season. That metric turned out to
+    # be noisy, and the heavy regularization flattened what field position is worth, which made going
+    # for it deep in your own territory look cheap. These settings win on log loss instead.
     wp_data = wp_rows(core)
     wp = xgb.XGBClassifier(
-        n_estimators=300, max_depth=4, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
-        min_child_weight=200, monotone_constraints=tuple(WP_FEATURES.values()), tree_method="hist",
+        n_estimators=600, max_depth=6, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
+        min_child_weight=50, monotone_constraints=tuple(WP_FEATURES.values()), tree_method="hist",
     )
     wp.fit(wp_matrix(wp_data), wp_data["won"])
 
@@ -430,6 +480,8 @@ def evaluate(b: dict, s: pd.DataFrame) -> pd.DataFrame:
     """Expected win probability of each option for each situation (row) in s."""
     s = s.reset_index(drop=True)
     y = s["yardline_100"].to_numpy(float)
+    inches = s["ydstogo"].to_numpy() == 0
+    s = s.assign(ydstogo=np.maximum(s["ydstogo"], 1))   # the models only know whole yards
     togo = s["ydstogo"].to_numpy(float)
     diff = s["score_differential"].to_numpy(float)
     ours = s["posteam_timeouts_remaining"].to_numpy(float)
@@ -449,15 +501,20 @@ def evaluate(b: dict, s: pd.DataFrame) -> pd.DataFrame:
         situations that actually happened, but here we need it for ones that didn't (like "what if
         they had punted instead?"). When the other team has the ball, everything is flipped to
         their point of view: their score margin, their timeouts, their side of the spread."""
-        state = pd.DataFrame({
-            "yardline_100": yl, "ydstogo": dist, "down": down, "score_differential": score,
-            "game_seconds_remaining": gsr_after if after_play else gsr,
-            "half_seconds_remaining": half_after if after_play else half,
-            "posteam_timeouts_remaining": ours if offense_is_us else theirs,
-            "defteam_timeouts_remaining": theirs if offense_is_us else ours,
-            "posteam_spread": spread if offense_is_us else -spread,
-        })
-        return b["wp"].predict_proba(wp_matrix(state))[:, 1]
+        total = 0.0
+        for offset, weight in SMOOTHING:  # average over neighboring yard lines (see SMOOTHING)
+            spot = np.clip(yl + offset, 1, 99)
+            state = pd.DataFrame({
+                "yardline_100": spot, "down": down, "score_differential": score,
+                "ydstogo": np.minimum(10, spot) if down == 1 else np.minimum(dist, spot),
+                "game_seconds_remaining": gsr_after if after_play else gsr,
+                "half_seconds_remaining": half_after if after_play else half,
+                "posteam_timeouts_remaining": ours if offense_is_us else theirs,
+                "defteam_timeouts_remaining": theirs if offense_is_us else ours,
+                "posteam_spread": spread if offense_is_us else -spread,
+            })
+            total = total + weight * b["wp"].predict_proba(wp_matrix(state))[:, 1]
+        return total / sum(w for _, w in SMOOTHING)
 
     def our_first_down(yl, score):
         return wp(yl, score, 1, np.minimum(10, yl), True)
@@ -470,11 +527,18 @@ def evaluate(b: dict, s: pd.DataFrame) -> pd.DataFrame:
     # to go). Placing the ball exactly at the sticks undersells going for it a little, because real
     # conversions often gain extra yards. Failure: the opponent takes over at the line of scrimmage.
     p_conv = b["conv"].predict_proba(conv_matrix(s))[:, 1]
+    p_conv = np.where(inches, 1 - (1 - p_conv) * INCHES_FAIL_SHARE, p_conv)   # see INCHES_FAIL_SHARE
     goal = togo >= y
     wp_conv = np.where(goal, their_first_down(np.full_like(y, b["kickoff_start"]), diff + TD_POINTS),
                        our_first_down(np.maximum(y - togo, 1), diff))
     wp_fail = their_first_down(100 - y, diff)
     go = p_conv * wp_conv + (1 - p_conv) * wp_fail
+    # The conservative lean (see FAIL_PENALTY), charged to the failure branch only, so it scales with
+    # how likely failing is. "go" stays the honest win probability; the call uses go_call.
+    depth = np.clip((y - OWN_HALF_LINE) / (99 - OWN_HALF_LINE), 0, 1)  # 0 at your own 45, 1 at your own 1
+    early = np.clip((gsr - 900) / 900, 0, 1)                           # 1 in the first half, 0 by the 4th quarter
+    penalty = FAIL_PENALTY * depth * early
+    go_call = p_conv * wp_conv + (1 - p_conv) * (wp_fail - penalty)
 
     # Field goal. Make: up 3 more, then kick off. Miss: NFL rules give the opponent the ball at the
     # spot of the kick (8 yards behind the line), or at their 20 if that spot is inside the 20.
@@ -483,19 +547,23 @@ def evaluate(b: dict, s: pd.DataFrame) -> pd.DataFrame:
     kick_spot = y + FG_OFFSET - 10
     wp_miss = their_first_down(np.minimum(100 - kick_spot, 80), diff)
     fg = p_make * wp_make + (1 - p_make) * wp_miss
+    # The take-the-points lean (see FG_BONUS), scaled by the chance the kick is good.
+    in_range = np.clip((FG_RANGE_LINE - y) / FG_RAMP, 0, 1)   # 0 at the opponent's 44, full from the 41 in
+    fg_call = fg + FG_BONUS * p_make * in_range * early
 
     # Punt: the opponent starts wherever punts from this spot usually leave them.
-    opp_start = np.clip(b["punt"].predict(pd.DataFrame({"yardline_100": y})), 1, 99)
+    landing = sum(w * b["punt"].predict(pd.DataFrame({"yardline_100": np.clip(y + o, 1, 99)})) for o, w in SMOOTHING)
+    opp_start = np.clip(landing / sum(w for _, w in SMOOTHING), 1, 99)
     punt = their_first_down(opp_start, diff)
 
     out = pd.DataFrame({
-        "go": go, "fg": fg, "punt": punt,
+        "go": go, "fg": fg, "punt": punt, "go_call": go_call, "fg_call": fg_call, "lean": penalty,
         "wp_now": wp(y, diff, 4, togo, True, after_play=False),   # before the decision, for context
         "p_convert": p_conv, "wp_convert": wp_conv, "wp_fail": wp_fail,
         "p_make": p_make, "kick_distance": y + FG_OFFSET, "wp_make": wp_make, "wp_miss": wp_miss,
         "punt_opp_yardline_100": opp_start,
     })
-    vals = out[OPTIONS].to_numpy()
+    vals = np.c_[go_call, fg_call, punt]  # decide with both leans applied
     order = np.argsort(-vals, axis=1)
     rows = np.arange(len(out))
     out["best"] = np.array(OPTIONS)[order[:, 0]]
@@ -505,8 +573,8 @@ def evaluate(b: dict, s: pd.DataFrame) -> pd.DataFrame:
     # punting. Solve p * wp_conv + (1 - p) * wp_fail = best_alternative for p. This turns "the
     # model says go" into something checkable: "you need 31%, and teams convert 55% of these".
     with np.errstate(divide="ignore", invalid="ignore"):
-        breakeven = (np.maximum(fg, punt) - wp_fail) / (wp_conv - wp_fail)
-    out["breakeven"] = np.where(wp_conv > wp_fail, np.clip(breakeven, 0, 1), np.nan)
+        breakeven = (np.maximum(fg_call, punt) - (wp_fail - penalty)) / (wp_conv - (wp_fail - penalty))
+    out["breakeven"] = np.where(wp_conv > wp_fail - penalty, np.clip(breakeven, 0, 1), np.nan)
     return out
 
 
@@ -533,6 +601,24 @@ SANITY_CASES = [
      dict(yardline_100=20, ydstogo=2, score_differential=-2, qtr=4, quarter_seconds_remaining=5), "fg"),
     ("4th & goal at the 1, tied, 1st quarter",
      dict(yardline_100=1, ydstogo=1, score_differential=0, qtr=1, quarter_seconds_remaining=600), "go"),
+    ("4th & 3 at your own 11, tied, 1st quarter",
+     dict(yardline_100=89, ydstogo=3, score_differential=0, qtr=1, quarter_seconds_remaining=600), "punt"),
+    ("4th & 5 at your own 25, tied, 1st quarter",
+     dict(yardline_100=75, ydstogo=5, score_differential=0, qtr=1, quarter_seconds_remaining=600), "punt"),
+    ("4th & 1 at your own 45, tied, 1st quarter",
+     dict(yardline_100=55, ydstogo=1, score_differential=0, qtr=1, quarter_seconds_remaining=600), "go"),
+    ("4th & 2 at the opp 45, tied, 1st quarter",
+     dict(yardline_100=45, ydstogo=2, score_differential=0, qtr=1, quarter_seconds_remaining=600), "go"),
+    ("4th & 2 at your own 16, tied, 1st quarter: too risky this early",
+     dict(yardline_100=84, ydstogo=2, score_differential=0, qtr=1, quarter_seconds_remaining=600), "punt"),
+    ("4th & 5 at your own 30, down 7, 1:30 left: no time to be careful",
+     dict(yardline_100=70, ydstogo=5, score_differential=-7, qtr=4, quarter_seconds_remaining=90), "go"),
+    ("4th & 4 at the opp 25, tied, 1st quarter: take the points",
+     dict(yardline_100=25, ydstogo=4, score_differential=0, qtr=1, quarter_seconds_remaining=600), "fg"),
+    ("4th & 1 at the opp 20, tied, 1st quarter",
+     dict(yardline_100=20, ydstogo=1, score_differential=0, qtr=1, quarter_seconds_remaining=600), "go"),
+    ("4th & 8 at the opp 41, tied, 5:00 left in the 2nd: a 59-yard try beats punting",
+     dict(yardline_100=41, ydstogo=8, score_differential=0, qtr=2, quarter_seconds_remaining=300), "fg"),
 ]
 DEFAULTS = dict(posteam_timeouts_remaining=3, defteam_timeouts_remaining=3, posteam_spread=0.0, indoors=False)
 
@@ -552,7 +638,12 @@ def check(b: dict | None = None) -> bool:
     fg_ok = bool(np.all(np.diff(kicks["p_make"]) <= 1e-9))
     print(f"{'PASS' if conv_ok else 'FAIL'}  conversion odds never rise as yards to go rises")
     print(f"{'PASS' if fg_ok else 'FAIL'}  field goal odds never rise as the kick gets longer")
-    return ok and conv_ok and fg_ok
+    spots = [{**base, "yardline_100": yl} for yl in range(2, 100, 7)]
+    inch = evaluate(b, states_frame([{**row, "ydstogo": 0} for row in spots]))
+    yard = evaluate(b, states_frame([{**row, "ydstogo": 1} for row in spots]))
+    inch_ok = bool(np.all(inch["go"].to_numpy() >= yard["go"].to_numpy() - 1e-9))
+    print(f"{'PASS' if inch_ok else 'FAIL'}  going for it on 4th & inches is never worse than on 4th & 1")
+    return ok and conv_ok and fg_ok and inch_ok
 
 
 # ===========================================================================
@@ -606,7 +697,10 @@ def browser_models(b: dict) -> dict:
         "punt": _browser_trees(b["punt"], probe[["yardline_100"]]),
         "fg": {"intercept": float(b["fg"].intercept_[0]), "coef": [float(c) for c in b["fg"].coef_[0]], "max": b["fg_max"]},
         "kickoff_start": b["kickoff_start"],
-        "constants": {"play_seconds": PLAY_SECONDS, "td_points": TD_POINTS, "fg_offset": FG_OFFSET},
+        "constants": {"play_seconds": PLAY_SECONDS, "td_points": TD_POINTS, "fg_offset": FG_OFFSET, "smoothing": SMOOTHING, "red_zone": RED_ZONE,
+                      "fail_penalty": FAIL_PENALTY, "own_half_line": OWN_HALF_LINE,
+                      "fg_bonus": FG_BONUS, "fg_range_line": FG_RANGE_LINE, "fg_ramp": FG_RAMP,
+                      "inches_fail_share": INCHES_FAIL_SHARE},
         "seasons": {"model": b["model_seasons"], "kick": b["kick_seasons"]},
     }
 
@@ -656,7 +750,7 @@ class Context(BaseModel):
 
 class GameState(Context):
     yardline_100: int = Field(ge=1, le=99, description="Yards from the opponent's end zone")
-    ydstogo: int = Field(ge=1, le=99)
+    ydstogo: int = Field(ge=0, le=99, description="Yards to go; 0 means inches")
 
     @model_validator(mode="after")
     def distance_fits(self):
@@ -717,8 +811,8 @@ def evaluate_one(state: GameState):
     return {
         "best": r["best"], "margin": f("margin"), "wp_now": f("wp_now"), "breakeven": f("breakeven"),
         "options": {
-            "go": {"wp": f("go"), "p_convert": f("p_convert"), "wp_convert": f("wp_convert"), "wp_fail": f("wp_fail")},
-            "fg": {"wp": f("fg"), "p_make": f("p_make"), "kick_distance": f("kick_distance"),
+            "go": {"wp": f("go"), "wp_with_lean": f("go_call"), "p_convert": f("p_convert"), "wp_convert": f("wp_convert"), "wp_fail": f("wp_fail")},
+            "fg": {"wp": f("fg"), "wp_with_lean": f("fg_call"), "p_make": f("p_make"), "kick_distance": f("kick_distance"),
                    "wp_make": f("wp_make"), "wp_miss": f("wp_miss")},
             "punt": {"wp": f("punt"), "opp_yardline_100": f("punt_opp_yardline_100")},
         },
