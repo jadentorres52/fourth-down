@@ -2,3 +2,4 @@ pbp_cache.parquet
 models.joblib
 .venv/
 __pycache__/
+nflverse_wp_model.ubj
