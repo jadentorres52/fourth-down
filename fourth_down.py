@@ -128,7 +128,7 @@ INCHES_FAIL_SHARE = 2 / 3
 # When the top two options are within TOSS_UP of each other, the calculator says it's a toss-up instead of
 # making a call, because the models can't reliably separate them. The exception is where one of the leans
 # is in play (before the 4th quarter, in your own half or in field goal range): there the lean decides.
-TOSS_UP = 0.01
+TOSS_UP = 0.025
 
 # Only these columns are kept from nflverse's ~370-column play-by-play table.
 PBP_COLUMNS = [
@@ -507,9 +507,6 @@ def train() -> None:
 
 # ===========================================================================
 # Decision engine
-#
-# Vectorized: each row of the input is one situation, and every model is called once per batch.
-# That's what lets /api/grid score ~1,400 situations for the heatmap in a single request.
 # ===========================================================================
 
 def predict_fg(b: dict, states: pd.DataFrame) -> np.ndarray:
