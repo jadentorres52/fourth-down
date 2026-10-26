@@ -82,8 +82,12 @@ MODEL_SEASONS = list(range(2011, CURRENT_SEASON))
 # down. The season in progress is included because recency matters most here.
 KICK_SEASONS = list(range(2023, CURRENT_SEASON + 1))
 
+# The win probability model uses every complete season nflverse has, back to 1999. It has the most to
+# learn (every play, and only one result per game) and was the least stable on less data.
+WP_SEASONS = list(range(1999, CURRENT_SEASON))
+
 TEST_SEASON = MODEL_SEASONS[-1]   # the last complete season is held out for evaluation
-ALL_SEASONS = sorted(set(MODEL_SEASONS) | set(KICK_SEASONS))
+ALL_SEASONS = sorted(set(MODEL_SEASONS) | set(KICK_SEASONS) | set(WP_SEASONS))
 
 # Simplifying assumptions about the states each option leads to. Each one is a fair answer to
 # "what would you improve?" in an interview.
@@ -121,6 +125,11 @@ FG_RAMP = 3          # yards to reach full strength, at the opponent's 41
 # midfield, a 68% conversion chance for a full yard becomes 79% for inches. ydstogo = 0 means inches.
 INCHES_FAIL_SHARE = 2 / 3
 
+# When the top two options are within TOSS_UP of each other, the calculator says it's a toss-up instead of
+# making a call, because the models can't reliably separate them. The exception is where one of the leans
+# is in play (before the 4th quarter, in your own half or in field goal range): there the lean decides.
+TOSS_UP = 0.01
+
 # Only these columns are kept from nflverse's ~370-column play-by-play table.
 PBP_COLUMNS = [
     "game_id", "play_id", "season", "week", "home_team", "away_team", "posteam", "defteam",
@@ -139,18 +148,23 @@ PBP_COLUMNS = [
 # there's no "defenders in the box" (recorded at the snap, partly in reaction to the offense) and
 # no EPA (computed from the play's result): using them would leak information the coach doesn't
 # have when deciding.
-WP_FEATURES = {
-    "score_differential": 1,          # your score minus theirs
-    "diff_time_ratio": 1,             # score difference, amplified as time runs out
-    "spread_time": 1,                 # pregame spread, faded as time runs out
-    "game_seconds_remaining": 0,      # more time helps the trailing team, hurts the leader
-    "half_seconds_remaining": 0,
-    "yardline_100": -1,               # yards from the opponent's end zone: farther = worse
-    "down": -1,
-    "ydstogo": -1,
-    "posteam_timeouts_remaining": 1,
-    "defteam_timeouts_remaining": -1,
-}
+# Win probability: my own model, built the way nflverse builds theirs. An earlier version of mine fit its
+# training games far better than unseen ones (log loss 0.441 vs 0.479) and its calls in rare late-game spots
+# flipped when retrained on resampled history. This one copies what works in nflverse's published model:
+# its inputs, every season back to 1999, small trees (theirs are at most 4 deep), monotone constraints,
+# and a tree count picked by early stopping on a held-out season. It scores the same as theirs on seasons
+# neither has trained on, with no gap between training and unseen data. "home" and "receive_2h_ko" (does
+# the offense get the 2nd-half kickoff) aren't calculator inputs, so evaluate() averages over both.
+WP_FEATURES = ["receive_2h_ko", "home", "half_seconds_remaining", "game_seconds_remaining", "Diff_Time_Ratio",
+               "score_differential", "down", "ydstogo", "yardline_100", "posteam_timeouts_remaining",
+               "defteam_timeouts_remaining"]
+# +1: win probability can only rise as the input rises, -1 only fall, 0 free (same order as WP_FEATURES).
+WP_PARAMS = dict(objective="binary:logistic", eta=0.1, max_depth=5, min_child_weight=100, subsample=0.8, colsample_bytree=0.8,
+                 monotone_constraints="(1,1,0,0,1,1,-1,-1,-1,1,-1)", tree_method="hist")
+WP_TREES = 280   # where log loss on the held-out 2023 season stopped improving
+# nflverse's published model, downloaded during training only as a benchmark to compare against.
+NFLVERSE_WP_URL = "https://raw.githubusercontent.com/nflverse/fastrmodels/master/data/wp_model.rda"
+NFLVERSE_WP_PATH = HERE / "nflverse_wp_model.ubj"
 CONV_FEATURES = {
     "ydstogo": -1,          # longer = harder
     "yardline_capped": 1,   # field position, but only inside the 20, where the field compresses and
@@ -200,7 +214,36 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def wp_matrix(df: pd.DataFrame) -> pd.DataFrame:
-    return add_features(df)[list(WP_FEATURES)]
+    """Inputs for nflverse's win probability model. Expects "home" and "receive_2h_ko" columns."""
+    f = df.copy()
+    f["Diff_Time_Ratio"] = f["score_differential"] / np.exp(-4 * (3600 - f["game_seconds_remaining"]) / 3600)
+    f["receive_2h_ko"] = np.where(f["half_seconds_remaining"] < f["game_seconds_remaining"], f["receive_2h_ko"], 0)  # 2nd half: always 0
+    return f[WP_FEATURES].astype("float32")
+
+
+def wp_predict(model, df: pd.DataFrame) -> np.ndarray:
+    return model.predict(xgb.DMatrix(wp_matrix(df).to_numpy()))
+
+
+def load_nflverse_wp() -> xgb.Booster:
+    """nflverse's published win probability model. The R package stores it as a raw vector inside an
+    .rda file; this pulls the XGBoost bytes out of R's serialization format and caches them."""
+    if not NFLVERSE_WP_PATH.exists():
+        import bz2, gzip, lzma, struct, urllib.request
+        data = urllib.request.urlopen(NFLVERSE_WP_URL).read()
+        for decompress in (lzma.decompress, gzip.decompress, bz2.decompress):
+            try:
+                data = decompress(data); break
+            except Exception:
+                pass
+        for i in range(len(data) - 8):  # a raw vector: type 24 in a 4-byte header, then its length, then the bytes
+            if data[i:i + 3] == b"\x00\x00\x00" and data[i + 3] == 24:
+                n = struct.unpack(">i", data[i + 4:i + 8])[0]
+                if 1000 < n <= len(data) - i - 8 and data[i + 8:i + 9] == b"{":
+                    NFLVERSE_WP_PATH.write_bytes(data[i + 8:i + 8 + n]); break
+    model = xgb.Booster()
+    model.load_model(bytearray(NFLVERSE_WP_PATH.read_bytes()))
+    return model
 
 
 def conv_matrix(df: pd.DataFrame) -> pd.DataFrame:
@@ -266,9 +309,14 @@ def prepare(pbp: pd.DataFrame) -> pd.DataFrame:
     df = df.assign(
         posteam_spread=np.where(home, df["spread_line"], -df["spread_line"]),
         indoors=df["roof"].isin(["dome", "closed"]).astype(int),
+        home=home.astype(int),
         won=(margin > 0).astype(int),
         tie=margin == 0,
     )
+
+    # Does the offense get the 2nd-half kickoff? It does if it kicked off to start the game (nflverse's definition).
+    opening_kickers = df.groupby("game_id")["defteam"].first()
+    df["receive_2h_ko"] = ((df["qtr"] <= 2) & (df["posteam"] == df["game_id"].map(opening_kickers))).astype(int)
 
     # For the punt model: who has the ball on the next scrimmage play, and where.
     nxt = df.groupby("game_id")[["posteam", "down", "yardline_100", "qtr"]].shift(-1)
@@ -280,8 +328,8 @@ def prepare(pbp: pd.DataFrame) -> pd.DataFrame:
 def wp_rows(df: pd.DataFrame) -> pd.DataFrame:
     """Every scrimmage play, labeled with whether the team that had the ball went on to win.
     Ties are dropped (rare, and they don't fit a win/loss label)."""
-    rows = df[~df["tie"]].dropna(subset=["posteam_spread", "posteam_timeouts_remaining", "result"])
-    return rows[STATE_COLUMNS + ["won", "season"]]  # only the columns needed, to keep memory down
+    rows = df[~df["tie"]].dropna(subset=["posteam_timeouts_remaining", "result"])
+    return rows[STATE_COLUMNS + ["won", "season", "home", "receive_2h_ko"]]  # only the columns needed
 
 
 def conversion_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -313,21 +361,12 @@ def punt_rows(df: pd.DataFrame) -> pd.DataFrame:
 # Training
 # ===========================================================================
 
-def fit_models(df: pd.DataFrame, model_seasons: list[int], kick_seasons: list[int]) -> dict:
+def fit_models(df: pd.DataFrame, model_seasons: list[int], kick_seasons: list[int], wp_seasons: list[int]) -> dict:
     core = df[df["season"].isin(model_seasons)]
 
-    # 1. Win probability: gradient-boosted trees (XGBoost). Trees handle the interactions that make
-    # WP hard (a 7-point lead means little in the 1st quarter and nearly everything with 2 minutes
-    # left) without hand-built features for each one. An earlier version used shallow trees with big
-    # leaves, chosen to minimize calibration error on one held-out season. That metric turned out to
-    # be noisy, and the heavy regularization flattened what field position is worth, which made going
-    # for it deep in your own territory look cheap. These settings win on log loss instead.
-    wp_data = wp_rows(core)
-    wp = xgb.XGBClassifier(
-        n_estimators=600, max_depth=6, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
-        min_child_weight=50, monotone_constraints=tuple(WP_FEATURES.values()), tree_method="hist",
-    )
-    wp.fit(wp_matrix(wp_data), wp_data["won"])
+    # 1. Win probability (see WP_FEATURES and WP_PARAMS).
+    wp_data = wp_rows(df[df["season"].isin(wp_seasons)])
+    wp = xgb.train(WP_PARAMS, xgb.DMatrix(wp_matrix(wp_data).to_numpy(), label=wp_data["won"].to_numpy()), num_boost_round=WP_TREES)
 
     # 2. Conversion: only a few hundred real attempts per season (about 900 in 2025), so a small,
     # heavily constrained model with a handful of features.
@@ -355,7 +394,7 @@ def fit_models(df: pd.DataFrame, model_seasons: list[int], kick_seasons: list[in
 
     # After any score, the other team gets a kickoff. Kickoff rules changed in 2024 and 2025, so
     # measure where drives start after kickoffs in the most recent season instead of hard-coding it.
-    latest = df[df["season"] == max(model_seasons + kick_seasons)]
+    latest = df[df["season"] == max(model_seasons + kick_seasons + wp_seasons)]
     firsts = latest.groupby(["game_id", "fixed_drive"]).head(1)
     kickoff_start = float(firsts.loc[firsts["drive_start_transition"] == "KICKOFF", "yardline_100"].mean())
 
@@ -391,14 +430,21 @@ def evaluate_holdout(df: pd.DataFrame) -> dict:
     strongly correlated (same teams, same final result), so a random split puts near-duplicates in
     both train and test and inflates the scores; and testing on a later season is how the model
     actually gets used."""
-    m = fit_models(df, [s for s in MODEL_SEASONS if s < TEST_SEASON], [s for s in KICK_SEASONS if s < TEST_SEASON])
+    m = fit_models(df, [s for s in MODEL_SEASONS if s < TEST_SEASON], [s for s in KICK_SEASONS if s < TEST_SEASON],
+                   [s for s in WP_SEASONS if s < TEST_SEASON])
     train = df[df["season"] < TEST_SEASON]
     test = df[df["season"] == TEST_SEASON]
     print(f"\nHoldout evaluation on the {TEST_SEASON} season (models trained only on earlier seasons)\n")
     metrics = {}
 
     w = wp_rows(test)
-    metrics["wp"] = calibration("Win probability", w["won"], m["wp"].predict_proba(wp_matrix(w))[:, 1])
+    metrics["wp"] = calibration("Win probability", w["won"], wp_predict(m["wp"], w))
+    train_rows = wp_rows(train[train["season"].isin(WP_SEASONS)])
+    print(f"    overfitting check: log loss {log_loss(train_rows['won'], wp_predict(m['wp'], train_rows)):.4f} on its training seasons")
+    try:
+        print(f"    benchmark: nflverse's published model scores {log_loss(w['won'], wp_predict(load_nflverse_wp(), w)):.4f} on the same season")
+    except Exception as exc:  # the benchmark is optional; training doesn't depend on it
+        print(f"    (benchmark skipped: {exc})")
 
     a_tr, a_te = conversion_rows(train), conversion_rows(test)
     metrics["conv"] = calibration("4th-down conversion", a_te["fourth_down_converted"],
@@ -447,9 +493,9 @@ def train() -> None:
 
     # Once the holdout has told us how good the approach is, refit on everything so the saved
     # models include the most recent data.
-    print(f"\nRefitting: WP/conversion on {MODEL_SEASONS[0]}-{MODEL_SEASONS[-1]}, "
+    print(f"\nRefitting: win probability on {WP_SEASONS[0]}-{WP_SEASONS[-1]}, conversion on {MODEL_SEASONS[0]}-{MODEL_SEASONS[-1]}, "
           f"field goals and punts on {KICK_SEASONS[0]}-{KICK_SEASONS[-1]}...")
-    bundle = fit_models(df, MODEL_SEASONS, KICK_SEASONS)
+    bundle = fit_models(df, MODEL_SEASONS, KICK_SEASONS, WP_SEASONS)
     bundle.update(metrics=metrics, model_seasons=MODEL_SEASONS, kick_seasons=KICK_SEASONS,
                   test_season=TEST_SEASON, plays=real_fourth_downs(df))
     joblib.dump(bundle, MODEL_PATH)
@@ -513,7 +559,11 @@ def evaluate(b: dict, s: pd.DataFrame) -> pd.DataFrame:
                 "defteam_timeouts_remaining": theirs if offense_is_us else ours,
                 "posteam_spread": spread if offense_is_us else -spread,
             })
-            total = total + weight * b["wp"].predict_proba(wp_matrix(state))[:, 1]
+            # Home field and the 2nd-half kickoff aren't calculator inputs, so average over both
+            # (receive_2h_ko only matters in the first half; wp_matrix zeroes it after that).
+            for home in (0, 1):
+                for receive in (0, 1):
+                    total = total + weight * 0.25 * wp_predict(b["wp"], state.assign(home=home, receive_2h_ko=receive))
         return total / sum(w for _, w in SMOOTHING)
 
     def our_first_down(yl, score):
@@ -549,6 +599,7 @@ def evaluate(b: dict, s: pd.DataFrame) -> pd.DataFrame:
     fg = p_make * wp_make + (1 - p_make) * wp_miss
     # The take-the-points lean (see FG_BONUS), scaled by the chance the kick is good.
     in_range = np.clip((FG_RANGE_LINE - y) / FG_RAMP, 0, 1)   # 0 at the opponent's 44, full from the 41 in
+    in_range = in_range * ~(goal & (y <= 3))                 # but never on 4th & goal from the 3 or closer
     fg_call = fg + FG_BONUS * p_make * in_range * early
 
     # Punt: the opponent starts wherever punts from this spot usually leave them.
@@ -568,6 +619,9 @@ def evaluate(b: dict, s: pd.DataFrame) -> pd.DataFrame:
     rows = np.arange(len(out))
     out["best"] = np.array(OPTIONS)[order[:, 0]]
     out["margin"] = vals[rows, order[:, 0]] - vals[rows, order[:, 1]]   # how much better than the runner-up
+    out["runner_up"] = np.array(OPTIONS)[order[:, 1]]
+    lean_active = (penalty > 0) | (FG_BONUS * p_make * in_range * early > 0)
+    out["toss_up"] = (out["margin"] < TOSS_UP) & ~lean_active     # see TOSS_UP
 
     # Break-even: the conversion rate at which going for it exactly ties the better of kicking and
     # punting. Solve p * wp_conv + (1 - p) * wp_fail = best_alternative for p. This turns "the
@@ -643,7 +697,12 @@ def check(b: dict | None = None) -> bool:
     yard = evaluate(b, states_frame([{**row, "ydstogo": 1} for row in spots]))
     inch_ok = bool(np.all(inch["go"].to_numpy() >= yard["go"].to_numpy() - 1e-9))
     print(f"{'PASS' if inch_ok else 'FAIL'}  going for it on 4th & inches is never worse than on 4th & 1")
-    return ok and conv_ok and fg_ok and inch_ok
+    late = evaluate(b, states_frame([{**base, "yardline_100": yl, "ydstogo": d} for yl in range(5, 96, 5) for d in (1, 3, 5)]))
+    early = evaluate(b, states_frame([{**base, "qtr": 1, "quarter_seconds_remaining": 600, "yardline_100": yl, "ydstogo": d}
+                                      for yl in list(range(5, 41, 5)) + list(range(60, 96, 5)) for d in (1, 3, 5)]))
+    toss_ok = bool((late["toss_up"] == (late["margin"] < TOSS_UP)).all() and not early["toss_up"].any())
+    print(f"{'PASS' if toss_ok else 'FAIL'}  toss-ups only where no lean is in play, and always when the call is that close")
+    return ok and conv_ok and fg_ok and inch_ok and toss_ok
 
 
 # ===========================================================================
@@ -658,7 +717,8 @@ def check(b: dict | None = None) -> bool:
 def _browser_trees(model, probe: pd.DataFrame) -> dict:
     """An XGBoost model as plain arrays: per tree [split feature, split value, left child, right child].
     At a leaf (left child -1) the split value slot holds the leaf's output instead."""
-    raw = json.loads(model.get_booster().save_raw(raw_format="json"))
+    booster = model if isinstance(model, xgb.Booster) else model.get_booster()
+    raw = json.loads(booster.save_raw(raw_format="json"))
     trees = [[t["split_indices"], [float(f"{v:.9g}") for v in t["split_conditions"]], t["left_children"], t["right_children"]]
              for t in raw["learner"]["gradient_booster"]["model"]["trees"]]
 
@@ -672,7 +732,7 @@ def _browser_trees(model, probe: pd.DataFrame) -> dict:
         return total
 
     sums = np.array([tree_sum(row) for row in probe.to_numpy(dtype=float)])
-    margins = model.get_booster().predict(xgb.DMatrix(probe), output_margin=True)
+    margins = booster.predict(xgb.DMatrix(probe.to_numpy(np.float32), feature_names=booster.feature_names), output_margin=True)
     base = float(np.mean(margins - sums))  # the constant every prediction starts from
     worst = float(np.max(np.abs(margins - sums - base)))
     if worst > 1e-4:
@@ -692,7 +752,7 @@ def browser_models(b: dict) -> dict:
         "posteam_spread": rng.choice([-7.0, -3.0, 0.0, 3.0, 7.0], n), "indoors": 0,
     })
     return {
-        "wp": _browser_trees(b["wp"], wp_matrix(probe)),
+        "wp": _browser_trees(b["wp"], wp_matrix(probe.assign(home=rng.integers(0, 2, n), receive_2h_ko=rng.integers(0, 2, n)))),
         "conv": _browser_trees(b["conv"], conv_matrix(probe)),
         "punt": _browser_trees(b["punt"], probe[["yardline_100"]]),
         "fg": {"intercept": float(b["fg"].intercept_[0]), "coef": [float(c) for c in b["fg"].coef_[0]], "max": b["fg_max"]},
@@ -700,7 +760,8 @@ def browser_models(b: dict) -> dict:
         "constants": {"play_seconds": PLAY_SECONDS, "td_points": TD_POINTS, "fg_offset": FG_OFFSET, "smoothing": SMOOTHING, "red_zone": RED_ZONE,
                       "fail_penalty": FAIL_PENALTY, "own_half_line": OWN_HALF_LINE,
                       "fg_bonus": FG_BONUS, "fg_range_line": FG_RANGE_LINE, "fg_ramp": FG_RAMP,
-                      "inches_fail_share": INCHES_FAIL_SHARE},
+                      "inches_fail_share": INCHES_FAIL_SHARE,
+                      "toss_up": TOSS_UP},
         "seasons": {"model": b["model_seasons"], "kick": b["kick_seasons"]},
     }
 
@@ -809,7 +870,7 @@ def evaluate_one(state: GameState):
     r = evaluate(models(), states_frame([state.model_dump()])).iloc[0]
     f = lambda k: clean(float(r[k]))  # noqa: E731
     return {
-        "best": r["best"], "margin": f("margin"), "wp_now": f("wp_now"), "breakeven": f("breakeven"),
+        "best": r["best"], "toss_up": bool(r["toss_up"]), "margin": f("margin"), "wp_now": f("wp_now"), "breakeven": f("breakeven"),
         "options": {
             "go": {"wp": f("go"), "wp_with_lean": f("go_call"), "p_convert": f("p_convert"), "wp_convert": f("wp_convert"), "wp_fail": f("wp_fail")},
             "fg": {"wp": f("fg"), "wp_with_lean": f("fg_call"), "p_make": f("p_make"), "kick_distance": f("kick_distance"),
